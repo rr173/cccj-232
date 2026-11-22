@@ -907,5 +907,666 @@ class RandomizedTest(LedgerCase):
         self.check("devB", 0, 14 * SHIFT)
 
 
+# ---------------------------------------------------------------------------
+# Settle export: independent oracle
+# ---------------------------------------------------------------------------
+
+def oracle_settle(messages, assignments, devices, t_from, t_to):
+    """Expected manifest, recomputed from the spec: effective readings
+    from the full accepted message history, job coverage evaluated
+    second by second."""
+    current = {}
+    for m in messages:
+        key = (m["device"], m["reading_id"])
+        if key not in current or m["revision"] > current[key]["revision"]:
+            current[key] = m
+    lines = []
+    for device in sorted(set(devices)):
+        points = sorted(
+            (m["time"], m["epoch"], m["counter"], m["reading_id"],
+             m["revision"])
+            for (dev, _), m in current.items()
+            if dev == device and m["op"] == "put")
+        assigns = [a for a in assignments if a["device"] == device]
+        for left, right in zip(points, points[1:]):
+            t1, e1, c1, id1, rev1 = left
+            t2, e2, c2, id2, rev2 = right
+            if not (t_from <= t2 < t_to):
+                continue
+            row = {"device": device, "start": t1, "end": t2,
+                   "left_id": id1, "left_revision": rev1,
+                   "right_id": id2, "right_revision": rev2}
+            if e1 != e2 or c2 < c1:
+                lines.append({**row, "status": "unmeasurable",
+                              "job": None, "amount": None})
+                continue
+            diff = c2 - c1
+            if diff == 0:
+                continue
+            overlap = False
+            uncovered = False
+            first_job = None
+            changed = False
+            for t in range(t1, t2):
+                jobs = {a["job"] for a in assigns
+                        if a["start"] <= t < a["end"]}
+                if len(jobs) >= 2:
+                    overlap = True
+                    break
+                if not jobs:
+                    uncovered = True
+                elif first_job is None:
+                    first_job = next(iter(jobs))
+                elif next(iter(jobs)) != first_job:
+                    changed = True
+            if overlap:
+                row.update(status="overlap", job=None, amount=diff)
+            elif uncovered:
+                row.update(status="uncovered", job=None, amount=diff)
+            elif changed:
+                row.update(status="handoff", job=None, amount=diff)
+            else:
+                row.update(status="allocated", job=first_job, amount=diff)
+            lines.append(row)
+    return lines
+
+
+def assignment(device, job, start, end):
+    return {"device": device, "job": job, "start": start, "end": end}
+
+
+class SettleCase(LedgerCase):
+    def setUp(self):
+        super().setUp()
+        self._na = 0
+
+    def write_assignments(self, lines):
+        """lines: assignment dicts or raw strings."""
+        self._na += 1
+        path = os.path.join(self.dir, f"assign{self._na}.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            for line in lines:
+                if isinstance(line, str):
+                    fh.write(line + "\n")
+                else:
+                    fh.write(json.dumps(line) + "\n")
+        return path
+
+    def settle(self, devices, t_from, t_to, assign_path, output="-",
+               extra_args=()):
+        args = ["settle", self.db, "--from", str(t_from),
+                "--to", str(t_to), "--assign", assign_path,
+                "-o", output] + list(extra_args) + list(devices)
+        return run_tool(args)
+
+    def settle_rows(self, devices, t_from, t_to, assign_path):
+        result = self.settle(devices, t_from, t_to, assign_path)
+        self.assertEqual(result.returncode, 0,
+                         f"settle failed: {result.stderr}")
+        return [json.loads(x) for x in result.stdout.splitlines()
+                if x.strip()]
+
+    def check_settle(self, devices, t_from, t_to, assignments):
+        path = self.write_assignments(assignments)
+        got = self.settle_rows(devices, t_from, t_to, path)
+        want = oracle_settle(self.accepted, assignments, devices,
+                             t_from, t_to)
+        self.assertEqual(got, want)
+        return got
+
+
+# ---------------------------------------------------------------------------
+# The narrative: hand-derived assignment timelines
+# ---------------------------------------------------------------------------
+
+class SettleNarrativeTest(SettleCase):
+    def test_same_job_rows_cover_then_real_gap(self):
+        self.apply([put("A", "r1", 1, "E", 100, 0),
+                    put("A", "r2", 1, "E", 200, 50)])
+        # Two overlapping rows of the SAME job, 70 + 60 = 130 seconds
+        # in total; every second of [100, 200) sees exactly job J.
+        path = self.write_assignments([assignment("A", "J", 90, 160),
+                                       assignment("A", "J", 150, 210)])
+        got = self.settle_rows(["A"], 0, 1000, path)
+        self.assertEqual(got, [{"device": "A", "start": 100, "end": 200,
+                                "left_id": "r1", "left_revision": 1,
+                                "right_id": "r2", "right_revision": 1,
+                                "status": "allocated", "job": "J",
+                                "amount": 50}])
+        # Same total length (65 + 65 = 130) but a real gap [155, 165).
+        path = self.write_assignments([assignment("A", "J", 90, 155),
+                                       assignment("A", "J", 165, 230)])
+        got = self.settle_rows(["A"], 0, 1000, path)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["status"], "uncovered")
+        self.assertIsNone(got[0]["job"])
+        self.assertEqual(got[0]["amount"], 50)
+
+    def test_abutting_jobs_are_handoff(self):
+        self.apply([put("B", "r1", 1, "E", 100, 0),
+                    put("B", "r2", 1, "E", 200, 30)])
+        # J1 hands over to J2 at exactly second 150: no gap, no overlap.
+        path = self.write_assignments([assignment("B", "J1", 100, 150),
+                                       assignment("B", "J2", 150, 200)])
+        got = self.settle_rows(["B"], 0, 1000, path)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["status"], "handoff")
+        self.assertIsNone(got[0]["job"])
+        self.assertEqual(got[0]["amount"], 30)
+
+    def test_overlap_outranks_uncovered(self):
+        self.apply([put("C", "r1", 1, "E", 100, 0),
+                    put("C", "r2", 1, "E", 300, 70)])
+        # Overlap on [150, 160) AND a bare stretch on [200, 300):
+        # one overlapping second decides the whole interval.
+        path = self.write_assignments([assignment("C", "J1", 100, 160),
+                                       assignment("C", "J2", 150, 200)])
+        got = self.settle_rows(["C"], 0, 1000, path)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["status"], "overlap")
+        self.assertIsNone(got[0]["job"])
+        self.assertEqual(got[0]["amount"], 70)
+
+    def test_exact_duplicate_rows_count_once(self):
+        self.apply([put("D", "r1", 1, "E", 100, 0),
+                    put("D", "r2", 1, "E", 200, 8)])
+        row = assignment("D", "J", 50, 250)
+        path = self.write_assignments([row, dict(row), dict(row)])
+        got = self.settle_rows(["D"], 0, 1000, path)
+        self.assertEqual([r["status"] for r in got], ["allocated"])
+        self.assertEqual(got[0]["amount"], 8)
+
+
+# ---------------------------------------------------------------------------
+# Adjacent export windows see the same whole intervals
+# ---------------------------------------------------------------------------
+
+class SettleWindowTest(SettleCase):
+    def test_interval_is_never_cut_at_window_edges(self):
+        self.apply([put("W", "r1", 1, "E", 100, 10),
+                    put("W", "r2", 1, "E", 400, 60)])
+        path = self.write_assignments([assignment("W", "J", 0, 1000)])
+        # The interval's right end (400) is outside [0, 250): no line,
+        # and the left end must NOT be fabricated at the range start.
+        self.assertEqual(self.settle_rows(["W"], 0, 250, path), [])
+        # [250, 500): the whole interval [100, 400) appears, with its
+        # true left reading that lies before the window.
+        got = self.settle_rows(["W"], 250, 500, path)
+        self.assertEqual(got, [{"device": "W", "start": 100, "end": 400,
+                                "left_id": "r1", "left_revision": 1,
+                                "right_id": "r2", "right_revision": 1,
+                                "status": "allocated", "job": "J",
+                                "amount": 50}])
+
+    def test_adjacent_windows_partition_the_chain(self):
+        self.apply([put("W2", "r1", 1, "E", 100, 0),
+                    put("W2", "r2", 1, "E", 250, 20),
+                    put("W2", "r3", 1, "E", 400, 45)])
+        path = self.write_assignments([assignment("W2", "J", 0, 1000)])
+        first = self.settle_rows(["W2"], 0, 300, path)
+        second = self.settle_rows(["W2"], 300, 500, path)
+        self.assertEqual([(r["start"], r["end"], r["amount"])
+                          for r in first], [(100, 250, 20)])
+        self.assertEqual([(r["start"], r["end"], r["amount"])
+                          for r in second], [(250, 400, 25)])
+        # Together the two windows account for each interval once,
+        # and the pieces still chain.
+        self.assertEqual(first[-1]["end"], second[0]["start"])
+
+    def test_readings_exactly_on_range_bounds(self):
+        self.apply([put("W3", "r0", 1, "E", 50, 0),
+                    put("W3", "r1", 1, "E", 100, 5),
+                    put("W3", "r2", 1, "E", 200, 15),
+                    put("W3", "r3", 1, "E", 300, 30)])
+        path = self.write_assignments([assignment("W3", "J", 0, 1000)])
+        # A reading exactly AT `from` closes an interval owned by this
+        # window; a reading exactly AT `to` belongs to the next one.
+        # [100, 300): right ends 100 and 200 are in, 300 is not.
+        got = self.settle_rows(["W3"], 100, 300, path)
+        self.assertEqual([(r["start"], r["end"]) for r in got],
+                         [(50, 100), (100, 200)])
+        # [0, 100): the only reading inside (50) ends no interval.
+        self.assertEqual(self.settle_rows(["W3"], 0, 100, path), [])
+        # [0, 101): now right end 100 qualifies -> [50, 100).
+        got = self.settle_rows(["W3"], 0, 101, path)
+        self.assertEqual([(r["start"], r["end"]) for r in got],
+                         [(50, 100)])
+        # [300, 400): right end 300 -> [200, 300), left end fetched as
+        # the true predecessor before the window.
+        got = self.settle_rows(["W3"], 300, 400, path)
+        self.assertEqual([(r["start"], r["end"]) for r in got],
+                         [(200, 300)])
+
+
+# ---------------------------------------------------------------------------
+# Zero difference, counter reset, epoch change, corrected evidence
+# ---------------------------------------------------------------------------
+
+class SettleReadingTest(SettleCase):
+    def test_zero_reset_epoch_and_correction(self):
+        self.apply([put("E", "r1", 1, "E1", 100, 500),
+                    put("E", "r2", 1, "E1", 200, 500),   # zero diff
+                    put("E", "r3", 1, "E1", 300, 450),   # falling
+                    put("E", "r4", 1, "E2", 400, 10)])   # epoch change
+        path = self.write_assignments([assignment("E", "J", 0, 1000)])
+        got = self.settle_rows(["E"], 0, 1000, path)
+        # [100,200) is a reliable zero: no line at all.  The other two
+        # intervals are unmeasurable even though J covers them fully.
+        self.assertEqual(
+            [(r["start"], r["status"], r["job"], r["amount"]) for r in got],
+            [(200, "unmeasurable", None, None),
+             (300, "unmeasurable", None, None)])
+        # Correct r2's counter upward at a higher revision: [100, 200)
+        # becomes settleable and the line cites the corrected evidence.
+        self.apply([put("E", "r2", 2, "E1", 200, 530)])
+        got = self.settle_rows(["E"], 0, 1000, path)
+        self.assertEqual(
+            [(r["start"], r["status"], r["amount"]) for r in got],
+            [(100, "allocated", 30),
+             (200, "unmeasurable", None),
+             (300, "unmeasurable", None)])
+        self.assertEqual((got[0]["left_id"], got[0]["left_revision"]),
+                         ("r1", 1))
+        self.assertEqual((got[0]["right_id"], got[0]["right_revision"]),
+                         ("r2", 2))
+        # Move r3 to a new second at a higher revision: the intervals
+        # reshape and every line cites the winning versions.
+        self.apply([put("E", "r3", 2, "E1", 250, 450)])
+        got = self.settle_rows(["E"], 0, 1000, path)
+        self.assertEqual(
+            [(r["start"], r["end"], r["left_id"], r["left_revision"],
+              r["right_id"], r["right_revision"], r["status"])
+             for r in got],
+            [(100, 200, "r1", 1, "r2", 2, "allocated"),
+             (200, 250, "r2", 2, "r3", 2, "unmeasurable"),
+             (250, 400, "r3", 2, "r4", 1, "unmeasurable")])
+
+    def test_unmeasurable_ignores_assignments(self):
+        self.apply([put("U", "r1", 1, "E1", 100, 50),
+                    put("U", "r2", 1, "E2", 200, 50)])  # epoch change
+        # The assignment situation would say "overlap"; the readings
+        # themselves win.
+        path = self.write_assignments([assignment("U", "J1", 100, 150),
+                                       assignment("U", "J2", 140, 200)])
+        got = self.settle_rows(["U"], 0, 1000, path)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["status"], "unmeasurable")
+        self.assertIsNone(got[0]["job"])
+        self.assertIsNone(got[0]["amount"])
+
+    def test_zero_interval_between_positive_ones(self):
+        self.apply([put("Z", "r1", 1, "E", 100, 10),
+                    put("Z", "r2", 1, "E", 200, 20),
+                    put("Z", "r3", 1, "E", 300, 20),   # zero: no line
+                    put("Z", "r4", 1, "E", 400, 35)])
+        # Jobs change across the silent interval; the sweep must still
+        # line up the later interval with its own facts.
+        path = self.write_assignments([assignment("Z", "J1", 100, 200),
+                                       assignment("Z", "J2", 300, 400)])
+        got = self.settle_rows(["Z"], 0, 1000, path)
+        self.assertEqual(
+            [(r["start"], r["status"], r["job"], r["amount"]) for r in got],
+            [(100, "allocated", "J1", 10),
+             (300, "allocated", "J2", 15)])
+
+    def test_assignment_edges_are_half_open(self):
+        self.apply([put("H", "r1", 1, "E", 100, 0),
+                    put("H", "r2", 1, "E", 200, 9)])
+        cases = [
+            # ends exactly at the interval start: covers nothing
+            ([assignment("H", "J", 0, 100)], "uncovered"),
+            # starts exactly at the interval end: covers nothing
+            ([assignment("H", "J", 200, 300)], "uncovered"),
+            # the two together still leave the whole interval bare
+            ([assignment("H", "J1", 0, 100),
+              assignment("H", "J2", 200, 300)], "uncovered"),
+            # exact fit
+            ([assignment("H", "J", 100, 200)], "allocated"),
+            # covers only the first half
+            ([assignment("H", "J", 50, 150)], "uncovered"),
+        ]
+        for i, (rows, want) in enumerate(cases):
+            with self.subTest(case=i):
+                path = self.write_assignments(rows)
+                got = self.settle_rows(["H"], 0, 1000, path)
+                self.assertEqual([r["status"] for r in got], [want])
+
+
+# ---------------------------------------------------------------------------
+# Ordering, deduplication, range bounds
+# ---------------------------------------------------------------------------
+
+class SettleOrderingTest(SettleCase):
+    def test_device_code_point_order_and_time_order(self):
+        # Code points: "A" 65 < "b" 98 < "z" 122 < "é" 233.
+        for dev in ("z", "A", "é", "b"):
+            self.apply([put(dev, "r1", 1, "E", 100, 0),
+                        put(dev, "r2", 1, "E", 150, 5),
+                        put(dev, "r3", 1, "E", 190, 25)])
+        path = self.write_assignments(
+            [assignment(d, "J", 0, 1000) for d in ("z", "A", "é", "b")])
+        # "b" is named twice: it must be settled once.
+        got = self.settle_rows(["é", "z", "b", "A", "b"], 0, 1000, path)
+        self.assertEqual([r["device"] for r in got],
+                         ["A", "A", "b", "b", "z", "z", "é", "é"])
+        for i in range(4):
+            pair = got[2 * i:2 * i + 2]
+            self.assertEqual([(r["start"], r["end"]) for r in pair],
+                             [(100, 150), (150, 190)])
+            self.assertEqual([r["amount"] for r in pair], [5, 20])
+
+    def test_latest_reading_is_reachable(self):
+        big = 2 ** 53 - 1
+        self.apply([put("T", "r1", 1, "E", big - 10, 0),
+                    put("T", "r2", 1, "E", big, 7)])
+        path = self.write_assignments(
+            [assignment("T", "J", big - 10, big)])
+        # TO may be 2^53 exactly, which selects the latest reading.
+        got = self.settle_rows(["T"], big - 10, 2 ** 53, path)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["status"], "allocated")
+        self.assertEqual(got[0]["amount"], 7)
+        # TO = big excludes the reading at big: no interval ends inside.
+        self.assertEqual(self.settle_rows(["T"], big - 10, big, path), [])
+        # FROM = big: r1 is only the predecessor, r2 is the right end.
+        got = self.settle_rows(["T"], big, 2 ** 53, path)
+        self.assertEqual([(r["start"], r["end"]) for r in got],
+                         [(big - 10, big)])
+
+    def test_bad_ranges_and_device_lists(self):
+        path = self.write_assignments([assignment("A", "J", 0, 10)])
+        for t_from, t_to in ((100, 100), (200, 100), (-1, 100),
+                             (0, 2 ** 53 + 1)):
+            with self.subTest(range=(t_from, t_to)):
+                result = self.settle(["A"], t_from, t_to, path)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+        # no device at all
+        result = run_tool(["settle", self.db, "--from", "0", "--to", "1",
+                           "--assign", path])
+        self.assertEqual(result.returncode, 2)
+
+
+# ---------------------------------------------------------------------------
+# Validation: every line judged, old manifest never clobbered
+# ---------------------------------------------------------------------------
+
+class SettleValidationTest(SettleCase):
+    def test_every_line_is_validated_and_failures_keep_old_manifest(self):
+        self.apply([put("A", "r1", 1, "E", 100, 0),
+                    put("A", "r2", 1, "E", 200, 5)])
+        out = os.path.join(self.dir, "out.jsonl")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write("delivered\n")
+        bad_lines = [
+            '{"device": "B"',                          # broken JSON
+            '[1, 2]',                                  # not an object
+            '"just a string"',                         # not an object
+            json.dumps({"job": "J", "start": 0, "end": 5}),     # no device
+            json.dumps({"device": "B", "start": 0, "end": 5}),  # no job
+            json.dumps({"device": "", "job": "J", "start": 0,
+                        "end": 5}),                              # empty device
+            json.dumps({"device": "B", "job": "", "start": 0,
+                        "end": 5}),                              # empty job
+            json.dumps({"device": "B", "job": 7, "start": 0, "end": 5}),
+            json.dumps({"device": "B", "job": "J", "start": 5,
+                        "end": 5}),                              # empty range
+            json.dumps({"device": "B", "job": "J", "start": 6,
+                        "end": 5}),                              # backwards
+            json.dumps({"device": "B", "job": "J", "start": -1,
+                        "end": 5}),                              # negative
+            json.dumps({"device": "B", "job": "J", "start": 0,
+                        "end": 2 ** 53}),                        # end too big
+            json.dumps({"device": "B", "job": "J", "start": 0.5,
+                        "end": 5}),                              # not an int
+            json.dumps({"device": "B", "job": "J", "start": True,
+                        "end": 5}),                              # bool
+            '{"device": "B", "job": "J", "start": 0, "end": NaN}',
+        ]
+        for i, bad in enumerate(bad_lines):
+            with self.subTest(line=i):
+                # The bad line concerns device B, not the settled
+                # device A: it must still fail the whole export.
+                path = self.write_assignments(
+                    [assignment("A", "J", 0, 1000), bad])
+                result = self.settle(["A"], 0, 1000, path, output=out)
+                self.assertEqual(result.returncode, 2)
+                with open(out, encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), "delivered\n")
+        # A missing assignment file is an input failure too.
+        result = self.settle(["A"], 0, 1000,
+                             os.path.join(self.dir, "no-such.jsonl"),
+                             output=out)
+        self.assertEqual(result.returncode, 2)
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "delivered\n")
+
+    def test_lines_for_other_devices_are_ignored_but_valid(self):
+        self.apply([put("A", "r1", 1, "E", 100, 0),
+                    put("A", "r2", 1, "E", 200, 5)])
+        path = self.write_assignments([
+            assignment("B", "JX", 0, 1000),     # not selected: validated
+            assignment("A", "J", 0, 1000),
+            "",                                 # blank lines carry nothing
+            assignment("C", "JY", 20, 30),
+            {"device": "A", "job": "J", "start": 0, "end": 1000,
+             "note": "extra fields are fine"},  # concurrent same job
+        ])
+        got = self.settle_rows(["A"], 0, 1000, path)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["job"], "J")
+
+    def test_output_file_atomicity_and_stdout_default(self):
+        self.apply([put("A", "r1", 1, "E", 100, 0),
+                    put("A", "r2", 1, "E", 200, 5)])
+        path = self.write_assignments([assignment("A", "J", 0, 1000)])
+        # Default output is stdout when -o is not given.
+        result = run_tool(["settle", self.db, "--from", "0", "--to",
+                           "1000", "--assign", path, "A"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(x) for x in result.stdout.splitlines()]
+        self.assertEqual(len(rows), 1)
+        # A real file gets the same content, atomically replaced.
+        out = os.path.join(self.dir, "out.jsonl")
+        result = self.settle(["A"], 0, 1000, path, output=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual([json.loads(x) for x in fh], rows)
+        # An unwritable destination reports an I/O failure (exit 1)
+        # and creates nothing.
+        missing = os.path.join(self.dir, "no-dir", "out.jsonl")
+        result = self.settle(["A"], 0, 1000, path, output=missing)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_empty_export_still_delivers_a_manifest(self):
+        path = self.write_assignments([assignment("A", "J", 0, 10)])
+        out = os.path.join(self.dir, "out.jsonl")
+        result = self.settle(["ghost"], 0, 1000, path, output=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "")
+
+    def test_settle_does_not_write_back_to_the_ledger(self):
+        self.apply([put("NL", "r1", 1, "E", 100, 0),
+                    put("NL", "r2", 1, "E", 200, 5)])
+        before = self.query("NL", 0, SHIFT)
+        path = self.write_assignments([assignment("NL", "J", 0, 1000)])
+        self.settle_rows(["NL"], 0, 1000, path)
+        self.assertEqual(self.query("NL", 0, SHIFT), before)
+        # A later apply still lands cleanly on the untouched ledger.
+        self.apply([put("NL", "r3", 1, "E", 300, 9)])
+        self.check("NL", 0, SHIFT)
+
+
+# ---------------------------------------------------------------------------
+# Density and nesting: no per-second expansion, no cross product
+# ---------------------------------------------------------------------------
+
+class SettleScaleTest(SettleCase):
+    def test_nested_assignments_dense_readings(self):
+        n_readings = 3000
+        n_rows = 1200
+        base = 1000
+        for chunk in range(3):
+            lines = []
+            for i in range(chunk * n_readings // 3,
+                           (chunk + 1) * n_readings // 3):
+                lines.append(put("F", f"r{i}", 1, "E", base + i, 100 + i))
+            self.apply(lines)
+        # Two jobs, each nested n_rows deep across the whole window:
+        # every second has both jobs, so every interval is one overlap
+        # line — never readings x assignments detail rows.
+        rows = []
+        for i in range(n_rows):
+            rows.append(assignment("F", "J1", i,
+                                   base + n_readings + 1000 - i))
+            rows.append(assignment("F", "J2", i + 1,
+                                   base + n_readings + 999 - i))
+        path = self.write_assignments(rows)
+        started = time.monotonic()
+        got = self.settle_rows(["F"], base, base + n_readings, path)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(got), n_readings - 1)
+        for r in got:
+            self.assertEqual(r["status"], "overlap")
+            self.assertIsNone(r["job"])
+            self.assertEqual(r["amount"], 1)
+        self.assertEqual(got[0]["start"], base)
+        self.assertEqual(got[-1]["end"], base + n_readings - 1)
+        for a, b in zip(got, got[1:]):
+            self.assertEqual(a["end"], b["start"])
+        self.assertLess(elapsed, 30,
+                        "nested assignments must not explode per second "
+                        "or per interval x row")
+
+    def test_window_skips_outlying_history(self):
+        # A long history before the window must not be walked: only the
+        # one predecessor of the window is fetched.
+        self.apply([put("G", f"old{i}", 1, "E", i, i)
+                    for i in range(2000)])
+        self.apply([put("G", "w0", 1, "E", 5000, 3000),
+                    put("G", "w1", 1, "E", 5100, 3010),
+                    put("G", "w2", 1, "E", 5200, 3025)])
+        path = self.write_assignments([assignment("G", "J", 0, 10000)])
+        started = time.monotonic()
+        got = self.settle_rows(["G"], 5000, 5300, path)
+        elapsed = time.monotonic() - started
+        # The interval ending at 5000 belongs to this window; its left
+        # end is the true predecessor at 1999, not the range start.
+        self.assertEqual([(r["start"], r["end"], r["amount"])
+                          for r in got],
+                         [(1999, 5000, 1001), (5000, 5100, 10),
+                          (5100, 5200, 15)])
+        self.assertLess(elapsed, 10)
+        # [2000, 5000) contains no right end: the long old history and
+        # the interval [1999, 5000) contribute nothing to it.
+        self.assertEqual(self.settle_rows(["G"], 2000, 5000, path), [])
+
+
+# ---------------------------------------------------------------------------
+# One committed snapshot, even under a concurrent apply
+# ---------------------------------------------------------------------------
+
+class SettleConcurrencyTest(SettleCase):
+    def test_snapshot_is_consistent_during_concurrent_apply(self):
+        self.apply([put("G", "r1", 1, "E", 100, 0),
+                    put("G", "r2", 1, "E", 200, 10),
+                    put("G", "r3", 1, "E", 300, 20)])
+        fifo = os.path.join(self.dir, "assign.fifo")
+        os.mkfifo(fifo)
+        out = os.path.join(self.dir, "out.jsonl")
+        proc = subprocess.Popen(
+            [sys.executable, "-I", TOOL, "settle", self.db,
+             "--from", "0", "--to", "400", "--assign", fifo,
+             "-o", out, "G"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # The tool pins its ledger snapshot BEFORE opening the
+        # assignment file; this open pairs with its reader only after
+        # that, so the apply below commits strictly after the snapshot.
+        with open(fifo, "w", encoding="utf-8") as fh:
+            self.apply([put("G", "r4", 1, "E", 250, 15),
+                        put("G", "r2", 2, "E", 200, 12)])
+            fh.write(json.dumps(assignment("G", "J", 0, 1000)) + "\n")
+        stdout, stderr = proc.communicate()
+        self.assertEqual(proc.returncode, 0, stderr)
+        with open(out, encoding="utf-8") as fh:
+            got = [json.loads(x) for x in fh if x.strip()]
+        # The manifest reflects only the pre-apply state: r4 does not
+        # exist and r2 is still revision 1 with counter 10 — no splice
+        # of the two ledger versions.
+        self.assertEqual(got, [
+            {"device": "G", "start": 100, "end": 200, "left_id": "r1",
+             "left_revision": 1, "right_id": "r2", "right_revision": 1,
+             "status": "allocated", "job": "J", "amount": 10},
+            {"device": "G", "start": 200, "end": 300, "left_id": "r2",
+             "left_revision": 1, "right_id": "r3", "right_revision": 1,
+             "status": "allocated", "job": "J", "amount": 10}])
+        # The ledger itself did move on.
+        self.assertEqual(effective_points(self.accepted, "G"),
+                         [(100, "E", 0), (200, "E", 12), (250, "E", 15),
+                          (300, "E", 20)])
+
+
+# ---------------------------------------------------------------------------
+# Randomized differential test against the oracle
+# ---------------------------------------------------------------------------
+
+class SettleRandomizedTest(SettleCase):
+    def test_random_scenarios(self):
+        rng = random.Random(20261123)
+        devices = ["d1", "d2"]
+        jobs = ["J1", "J2", "J3"]
+        live = {}    # (device, rid) -> highest revision applied
+        points = {}  # (device, rid) -> second of the effective put
+        used = {d: set() for d in devices}
+        for trial in range(25):
+            with self.subTest(trial=trial):
+                for _ in range(rng.randint(1, 3)):
+                    batch = []
+                    batch_ids = set()
+                    for _ in range(rng.randint(1, 6)):
+                        dev = rng.choice(devices)
+                        rid = f"r{rng.randint(0, 7)}"
+                        key = (dev, rid)
+                        if key in batch_ids:
+                            continue
+                        rev = live.get(key, 0) + rng.choice([1, 1, 2])
+                        if key in points and rng.random() < 0.15:
+                            batch.append(delete(dev, rid, rev))
+                            batch_ids.add(key)
+                            live[key] = rev
+                            used[dev].discard(points.pop(key))
+                            continue
+                        old_t = points.get(key)
+                        free = [x for x in range(601)
+                                if x not in used[dev] or x == old_t]
+                        if not free:
+                            continue
+                        t = rng.choice(free)
+                        batch.append(put(dev, rid, rev,
+                                         rng.choice(["E1", "E1", "E2"]),
+                                         t, rng.randint(0, 50)))
+                        batch_ids.add(key)
+                        live[key] = rev
+                        if old_t is not None:
+                            used[dev].discard(old_t)
+                        points[key] = t
+                        used[dev].add(t)
+                    if batch:
+                        self.apply(batch)
+                assigns = []
+                for _ in range(rng.randint(0, 8)):
+                    s = rng.randint(0, 600)
+                    assigns.append(assignment(
+                        rng.choice(devices + ["other"]),
+                        rng.choice(jobs), s, s + rng.randint(1, 200)))
+                if assigns and rng.random() < 0.5:
+                    assigns.append(dict(assigns[0]))  # exact duplicate
+                t_from = rng.randint(0, 500)
+                t_to = t_from + rng.randint(1, 250)
+                self.check_settle(devices, t_from, t_to, assigns)
+
+
 if __name__ == "__main__":
     unittest.main()

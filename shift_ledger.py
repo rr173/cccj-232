@@ -68,14 +68,72 @@ history, and never walks dense readings inside a shift one by one.
 Import files and query results are streamed; oversized scratch data lives
 in temporary tables on disk.
 
+`settle` reconciles the ledger with a job-assignment timeline and exports
+a settlement manifest as JSONL:
+
+    python3 -I shift_ledger.py settle DB --from FROM --to TO
+        --assign ASSIGNMENTS [-o OUTPUT] DEVICE [DEVICE ...]
+
+The assignment file holds one JSON object per line: device (non-empty
+string), job (non-empty string), start/end (integer UTC seconds,
+0 <= start < end <= 2^53-1).  [start, end) is left-closed right-open, and
+several simultaneously active rows for the same device and job count as
+one job.  Line order is irrelevant.  Every line is validated, even lines
+naming devices not being settled; any invalid line rejects the whole
+export and leaves a previously delivered manifest untouched.
+
+For each device (naming one twice settles it once), metering intervals
+are the adjacent pairs of effective readings, exactly as above.  The
+export emits every interval whose right reading time falls in
+[FROM, TO): the left reading may lie before FROM and is the true previous
+reading, never the range start, and no interval is ever cut to fit the
+range — adjacent export windows agree on the same intervals.  For an
+interval [t1, t2) the assignment facts are judged over its whole span,
+including any part before FROM.  One JSONL line per emitted interval,
+ordered by device (Unicode code points) then right-end second:
+
+    device, start, end,
+    left_id, left_revision, right_id, right_revision,
+    status, job, amount
+
+status is one of:
+
+    allocated     reliable positive difference; every second of the
+                  interval had exactly the same single job available.
+                  job names it; amount is the full difference, never
+                  apportioned.
+    overlap       some second had two different jobs active.
+    uncovered     no overlapping second, but some second had no job.
+    handoff       every second had exactly one job, but not always the
+                  same one.
+    unmeasurable  epoch change or falling counter; job and amount are
+                  null whatever the assignments say.
+
+overlap / uncovered / handoff keep one detail line with the full positive
+difference and job null.  A reliable zero difference settles nothing and
+emits no line.
+
+The whole export reads one committed snapshot of the ledger: an apply
+committing while it runs cannot splice two ledger versions into one
+manifest.  Only the window's readings plus one predecessor per device
+are fetched; assignments are streamed into indexed temporary tables and
+swept once per device — never expanded per second or shift, never
+rescanned per interval, and never joined into an interval-by-assignment
+cross product.  Python memory holds neither the full assignment table
+nor the selected readings nor the manifest; scratch data lives in
+temporary tables on disk.  OUTPUT is written atomically (temp file +
+rename); any failure leaves the previous manifest in place.
+
 Usage:
     python3 -I shift_ledger.py apply DB JSONL
     python3 -I shift_ledger.py query DB DEVICE START END [-o OUTPUT]
+    python3 -I shift_ledger.py settle DB --from FROM --to TO
+        --assign ASSIGNMENTS [-o OUTPUT] DEVICE [DEVICE ...]
 
 Exit status:
     0  success
     2  invalid input (bad JSONL/message, version or time conflict, bad
-       query range)
+       query range, bad settle range, bad assignment JSONL)
     1  I/O or unexpected failure
 """
 
@@ -106,6 +164,10 @@ class QueryError(Exception):
 
 class LedgerIOError(Exception):
     """The database or an output file could not be opened or written."""
+
+
+class AssignmentError(Exception):
+    """The assignment JSONL given to `settle` is invalid."""
 
 
 def _reject_constant(name):
@@ -715,6 +777,319 @@ def run_query(db_path, device, start, end, output_path):
 
 
 # ---------------------------------------------------------------------------
+# Settle export
+# ---------------------------------------------------------------------------
+
+def validate_assignment(obj, where):
+    """Return (device, job, start, end) or raise AssignmentError."""
+    if not isinstance(obj, dict):
+        raise AssignmentError(f"{where}: line must be a JSON object")
+    device = obj.get("device")
+    if not isinstance(device, str) or not device:
+        raise AssignmentError(
+            f"{where}: 'device' must be a non-empty string")
+    job = obj.get("job")
+    if not isinstance(job, str) or not job:
+        raise AssignmentError(f"{where}: 'job' must be a non-empty string")
+    start = obj.get("start")
+    if not _is_int(start) or start < 0:
+        raise AssignmentError(f"{where}: 'start' must be an integer >= 0")
+    end = obj.get("end")
+    if not _is_int(end) or end > MAX_TIME:
+        raise AssignmentError(
+            f"{where}: 'end' must be an integer <= {MAX_TIME}")
+    if start >= end:
+        raise AssignmentError(f"{where}: 'start' must be smaller than 'end'")
+    return device, job, start, end
+
+
+def load_assignments(conn, input_path, wanted):
+    """Stream the assignment JSONL into a temp table for wanted devices.
+
+    Every line is validated — including lines for devices not being
+    settled — but only the wanted devices' rows are kept.  Returns
+    (received, kept).
+    """
+    conn.execute("DROP TABLE IF EXISTS temp.assign")
+    conn.execute(
+        "CREATE TEMP TABLE assign ("
+        "device TEXT NOT NULL, job TEXT NOT NULL, "
+        "start INTEGER NOT NULL, end INTEGER NOT NULL)")
+    close = False
+    if input_path == "-":
+        fh = sys.stdin
+    else:
+        try:
+            fh = open(input_path, "r", encoding="utf-8")
+        except OSError as exc:
+            raise AssignmentError(
+                f"cannot read assignments {input_path!r}: "
+                f"{exc.strerror or exc}") from exc
+        close = True
+    received = 0
+    kept = 0
+    try:
+        insert = ("INSERT INTO assign (device, job, start, end) "
+                  "VALUES (?,?,?,?)")
+        lineno = 0
+        try:
+            for line in fh:
+                lineno += 1
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text, parse_constant=_reject_constant)
+                except (ValueError, RecursionError) as exc:
+                    raise AssignmentError(
+                        f"line {lineno}: invalid JSON: {exc}")
+                device, job, start, end = validate_assignment(
+                    row, f"line {lineno}")
+                received += 1
+                if device in wanted:
+                    conn.execute(insert, (device, job, start, end))
+                    kept += 1
+        except UnicodeDecodeError as exc:
+            raise AssignmentError(
+                f"assignments are not valid UTF-8: {exc}") from exc
+        except OSError as exc:
+            raise AssignmentError(
+                f"cannot read assignments: {exc}") from exc
+    finally:
+        if close:
+            fh.close()
+    conn.execute("CREATE INDEX IF NOT EXISTS temp.assign_by_start "
+                 "ON assign (device, start, end, job)")
+    conn.execute("CREATE INDEX IF NOT EXISTS temp.assign_by_end "
+                 "ON assign (device, end, start, job)")
+    return received, kept
+
+
+class AssignmentSweep:
+    """One device's assignment coverage, swept left to right.
+
+    The live set (job -> number of concurrent rows) sits in the temp
+    table `active`, so nested assignments never pile up in Python
+    memory; several concurrent rows of one job still count as one job.
+    Add/remove events stream lazily from the two indexes — positions
+    beyond the last classified interval are never read.
+    """
+
+    def __init__(self, conn, device, t0):
+        self.conn = conn
+        self.distinct = 0
+        conn.execute("DELETE FROM active")
+        for job, n in conn.execute(
+                "SELECT job, COUNT(*) FROM assign "
+                "WHERE device = ? AND start <= ? AND end > ? GROUP BY job",
+                (device, t0, t0)):
+            conn.execute("INSERT INTO active (job, n) VALUES (?, ?)",
+                         (job, n))
+            self.distinct += 1
+        self.adds = conn.execute(
+            "SELECT start, job FROM assign "
+            "WHERE device = ? AND start > ? ORDER BY start", (device, t0))
+        self.rems = conn.execute(
+            "SELECT end, job FROM assign "
+            "WHERE device = ? AND end > ? ORDER BY end", (device, t0))
+        self.next_add = next(self.adds, None)
+        self.next_rem = next(self.rems, None)
+
+    def position(self):
+        """Next event position, or None when both streams run dry."""
+        pos = None
+        if self.next_add is not None:
+            pos = self.next_add[0]
+        if self.next_rem is not None and \
+                (pos is None or self.next_rem[0] < pos):
+            pos = self.next_rem[0]
+        return pos
+
+    def _add(self, job):
+        cur = self.conn.execute(
+            "UPDATE active SET n = n + 1 WHERE job = ?", (job,))
+        if cur.rowcount == 0:
+            self.conn.execute(
+                "INSERT INTO active (job, n) VALUES (?, 1)", (job,))
+            self.distinct += 1
+
+    def _remove(self, job):
+        self.conn.execute(
+            "UPDATE active SET n = n - 1 WHERE job = ?", (job,))
+        cur = self.conn.execute(
+            "DELETE FROM active WHERE job = ? AND n <= 0", (job,))
+        if cur.rowcount:
+            self.distinct -= 1
+
+    def advance_to(self, pos):
+        """Apply every event at `pos` (the position() just reported)."""
+        while self.next_add is not None and self.next_add[0] == pos:
+            self._add(self.next_add[1])
+            self.next_add = next(self.adds, None)
+        while self.next_rem is not None and self.next_rem[0] == pos:
+            self._remove(self.next_rem[1])
+            self.next_rem = next(self.rems, None)
+
+
+class IntervalStats:
+    """What the sweep saw of one metering interval, second by second."""
+
+    __slots__ = ("overlap", "min_distinct", "first_job", "changed")
+
+    def __init__(self):
+        self.overlap = False       # some second had 2+ different jobs
+        self.min_distinct = None   # fewest jobs active on any second
+        self.first_job = None      # the single job of the first 1-job second
+        self.changed = False       # a later 1-job second had another job
+
+
+def sweep_interval(sweep, stats, lo, hi):
+    """Fold the assignment coverage of [lo, hi) into stats.
+
+    Only event positions are visited; seconds between two events share
+    one coverage state, so nothing is ever expanded per second.  Events
+    at positions <= lo are caught up first (they belong to intervals
+    that needed no classification of their own).
+    """
+    pos = sweep.position()
+    while pos is not None and pos <= lo:
+        sweep.advance_to(pos)
+        pos = sweep.position()
+    _note(sweep, stats)
+    while pos is not None and pos < hi:
+        sweep.advance_to(pos)
+        _note(sweep, stats)
+        pos = sweep.position()
+
+
+def _note(sweep, stats):
+    if sweep.distinct >= 2:
+        stats.overlap = True
+        return  # one overlapping second already decides the interval
+    if stats.min_distinct is None or sweep.distinct < stats.min_distinct:
+        stats.min_distinct = sweep.distinct
+    if sweep.distinct == 1 and not stats.changed:
+        job = sweep.conn.execute("SELECT job FROM active").fetchone()[0]
+        if stats.first_job is None:
+            stats.first_job = job
+        elif stats.first_job != job:
+            stats.changed = True
+
+
+def classify_interval(stats):
+    """Map one interval's coverage stats to (status, job)."""
+    if stats.overlap:
+        return "overlap", None
+    if stats.min_distinct == 0:
+        return "uncovered", None
+    if stats.changed:
+        return "handoff", None
+    return "allocated", stats.first_job
+
+
+def emit_settle(writer, device, left, right, status, job, amount):
+    writer.line({
+        "device": device,
+        "start": left[2],
+        "end": right[2],
+        "left_id": left[0],
+        "left_revision": left[1],
+        "right_id": right[0],
+        "right_revision": right[1],
+        "status": status,
+        "job": job,
+        "amount": amount,
+    })
+
+
+def settle_device(conn, device, t_from, t_to, writer):
+    """Emit one manifest line per interval of `device` whose right
+    reading time falls in [t_from, t_to).  Returns the line count.
+
+    Reads only the window's readings plus the single predecessor that
+    may open the first interval; the device's history outside the
+    window is never scanned.
+    """
+    pred = conn.execute(
+        "SELECT reading_id, revision, time, epoch, counter FROM readings "
+        "WHERE device = ? AND op = 'put' AND time < ? "
+        "ORDER BY time DESC LIMIT 1", (device, t_from)).fetchone()
+    cursor = conn.execute(
+        "SELECT reading_id, revision, time, epoch, counter FROM readings "
+        "WHERE device = ? AND op = 'put' AND time >= ? AND time < ? "
+        "ORDER BY time", (device, t_from, t_to))
+    row = next(cursor, None)
+    if row is None:
+        return 0
+    prev = pred
+    if prev is None:
+        prev = row  # the device's earliest reading ends no interval
+        row = next(cursor, None)
+    sweep = None
+    emitted = 0
+    while row is not None:
+        lo, hi = prev[2], row[2]
+        e1, c1 = prev[3], prev[4]
+        e2, c2 = row[3], row[4]
+        if e1 != e2 or c2 < c1:
+            # The readings themselves are unreliable; no assignment
+            # fact may paper over that.
+            emit_settle(writer, device, prev, row,
+                        "unmeasurable", None, None)
+            emitted += 1
+        elif c2 > c1:
+            if sweep is None:
+                sweep = AssignmentSweep(conn, device, lo)
+            stats = IntervalStats()
+            sweep_interval(sweep, stats, lo, hi)
+            status, job = classify_interval(stats)
+            emit_settle(writer, device, prev, row, status, job, c2 - c1)
+            emitted += 1
+        # else: a reliable zero difference settles nothing — no line.
+        prev = row
+        row = next(cursor, None)
+    return emitted
+
+
+def run_settle(db_path, devices, t_from, t_to, assign_path, output_path):
+    if not 0 <= t_from < t_to <= MAX_TIME + 1:
+        raise QueryError(
+            f"range must satisfy 0 <= FROM < TO <= {MAX_TIME + 1}")
+    wanted = set()
+    for device in devices:
+        if not isinstance(device, str) or not device:
+            raise QueryError("DEVICE must be a non-empty string")
+        wanted.add(device)
+    conn = connect(db_path)
+    writer = None
+    try:
+        conn.execute("BEGIN")
+        # Pin one committed snapshot of the ledger before touching any
+        # slow input.  WAL keeps it readable for the whole export, so an
+        # apply committing mid-export can never splice a second ledger
+        # version into this manifest.
+        conn.execute("SELECT 1 FROM readings LIMIT 1").fetchone()
+        conn.execute("DROP TABLE IF EXISTS temp.active")
+        conn.execute("CREATE TEMP TABLE active ("
+                     "job TEXT PRIMARY KEY, n INTEGER NOT NULL)")
+        received, kept = load_assignments(conn, assign_path, wanted)
+        writer = OutputWriter(output_path)
+        emitted = 0
+        for device in sorted(wanted):
+            emitted += settle_device(conn, device, t_from, t_to, writer)
+        writer.commit()
+        conn.commit()
+        return received, kept, emitted
+    except BaseException:
+        conn.rollback()
+        if writer is not None:
+            writer.abort()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
 
@@ -744,6 +1119,27 @@ def build_parser():
     p_query.add_argument("-o", "--output", default="-",
                          help="JSONL destination; '-' means stdout "
                               "(default)")
+
+    p_settle = sub.add_parser(
+        "settle", help="export a settlement manifest reconciling metering "
+                       "intervals with the assignment timeline")
+    p_settle.add_argument("db", help="SQLite ledger path")
+    p_settle.add_argument("--from", dest="from_", type=int, required=True,
+                          metavar="FROM",
+                          help="first second of the settlement range "
+                               "(inclusive)")
+    p_settle.add_argument("--to", dest="to_", type=int, required=True,
+                          metavar="TO",
+                          help="end of the settlement range (exclusive); "
+                               "may be 2^53")
+    p_settle.add_argument("--assign", required=True, metavar="ASSIGNMENTS",
+                          help="assignment JSONL file, or '-' for stdin")
+    p_settle.add_argument("-o", "--output", default="-",
+                          help="manifest destination; '-' means stdout "
+                               "(default)")
+    p_settle.add_argument("devices", nargs="+", metavar="DEVICE",
+                          help="device(s) to settle; duplicates are "
+                               "settled once")
     return parser
 
 
@@ -754,10 +1150,16 @@ def main(argv=None):
             received, applied = apply_batch(args.db, args.input)
             print(f"shift_ledger: applied {applied} of {received} "
                   f"message(s)", file=sys.stderr)
-        else:
+        elif args.command == "query":
             run_query(args.db, args.device, args.start, args.end,
                       args.output)
-    except (BatchError, QueryError) as exc:
+        else:
+            received, kept, emitted = run_settle(
+                args.db, args.devices, args.from_, args.to_,
+                args.assign, args.output)
+            print(f"shift_ledger: exported {emitted} row(s) from {kept} "
+                  f"of {received} assignment(s)", file=sys.stderr)
+    except (BatchError, QueryError, AssignmentError) as exc:
         print(f"shift_ledger: invalid input: {exc}", file=sys.stderr)
         return 2
     except LedgerIOError as exc:
