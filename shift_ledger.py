@@ -124,34 +124,131 @@ nor the selected readings nor the manifest; scratch data lives in
 temporary tables on disk.  OUTPUT is written atomically (temp file +
 rename); any failure leaves the previous manifest in place.
 
+Offline replica sync (`sync-init`, `sync-pack`, `sync-receive`)
+================================================================
+
+A branch office keeps its own SQLite copy of the ledger but has no
+network access to the central database.  Synchronisation travels by
+handed-over files only: the centre publishes an increment *pack*, the
+branch feeds it to its copy.  There is no service and no two-way merge;
+a replica never invents changes and cannot act as a centre.
+
+The centre's synchronisation identity is generated once, persisted in
+the database, and never replaced afterwards — later `apply` and export
+runs on that database stay bound to it.  Separate centres generate
+independent identities.  Synchronisation positions start at 0 (a blank
+replica).  When sync is first enabled on a ledger that already holds
+data, every current highest version (tombstones included) becomes
+version 1; an empty ledger starts at 0 and needs no replay of the
+original inputs.  From then on, every `apply` whose winners change at
+least one highest version advances the position by one — a revision
+bump that leaves the reading values untouched still advances, while a
+failed batch, an old-only batch, or an identical replay does not.  The
+position commits in the same transaction as that apply's result.
+
+`sync-pack DB --base N [-o PACK]` publishes a pack from centre DB.
+The pack names the source identity, the base position N and the end
+position, which is one complete committed version seen while packing.
+For every (device, reading_id) that changed at least once between the
+two positions the pack carries exactly one row: that identity's
+highest version at the end position, including a delete tombstone.
+Identities that never changed are not carried.  Base 0 means "sync
+from blank" and carries the whole current state.  A base beyond the
+current position is an error; a base equal to the current position
+reports "no update" and leaves the target file untouched.  An apply
+committing while a pack is built may land in this pack or the next,
+but one pack's end position and its rows always belong to the same
+committed snapshot.  The changed-identity set is held in a durable
+log table updated inside each apply transaction, so a small daily
+pack scans only changed identities, never the untouched history, and
+a pack's business rows grow with the number of changed identities,
+not with how often each was modified.
+
+`sync-receive DB PACK` applies a pack to a branch copy.  The first
+pack may only enter an empty, unbound database and must have base 0;
+it binds the copy to the pack's source identity.  Afterwards every
+pack must come from that same identity and its base must equal the
+copy's current position — a missing pack (gap), an out-of-order pack,
+or a foreign source is rejected without any guessed merge.  Replaying
+the byte-identical file that was just accepted is a successful
+no-op (matched by file digest); a different file ending at the same
+position is not a replay and is refused.  A replica cannot run plain
+`apply` (so it cannot alter readings) and cannot pack.  Rows are
+loaded and judged as the pack's *final* state, exactly like one big
+batch: per-row intermediate seconds never reject a state whose
+post-pack readings are legal.  Readings, shift summaries, the source
+binding and the sync position take effect together, in one
+transaction, only after the whole pack has been verified; after a bad
+pack or a failure, reopening the database shows the old state and the
+original good pack can still be re-fed.  Success reports the copy's
+new current position, which is the base for the next pack.  Replicas
+keep using the unchanged `query` and `settle` (including the reading
+evidence revisions in `settle` output); the assignment table is not
+part of a pack and the accounting rules never change.
+
+Pack file format (binary, streamed; big packs spill to disk via temp
+tables and never load whole into memory):
+
+    magic      8 bytes  b"SLPACK01"
+    frame      u32 LE length L, L bytes UTF-8 JSON header, then...
+    frame      repeated zero or more times: u32 LE length L, L bytes
+               UTF-8 JSON row
+    frame      one zero-length frame (L = 0) marks the end of rows
+    digest     32 raw bytes: SHA-256 over every byte preceding it
+               (magic, header frame, row frames, the zero frame)
+    then the file must end immediately
+
+The header JSON is {"format":1,"source":ID,"base":N,"end":M} with
+N >= 0, M >= N; each row JSON is {"device":...,"reading_id":...,
+"revision":...,"op":"put"|"delete", and for puts "epoch","time",
+"counter"}.  The length-prefixed framing makes truncation detectable,
+the digest detects any altered content, and the required immediate EOF
+detects extra trailing bytes (transport errors only; no signatures).
+
 Usage:
     python3 -I shift_ledger.py apply DB JSONL
     python3 -I shift_ledger.py query DB DEVICE START END [-o OUTPUT]
     python3 -I shift_ledger.py settle DB --from FROM --to TO
         --assign ASSIGNMENTS [-o OUTPUT] DEVICE [DEVICE ...]
+    python3 -I shift_ledger.py sync-init DB
+    python3 -I shift_ledger.py sync-pack DB --base N [-o PACK]
+    python3 -I shift_ledger.py sync-receive DB PACK
 
 Exit status:
     0  success
     2  invalid input (bad JSONL/message, version or time conflict, bad
-       query range, bad settle range, bad assignment JSONL)
+       query range, bad settle range, bad assignment JSONL, bad or
+       inapplicable sync pack, wrong sync position or source)
     1  I/O or unexpected failure
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
 import sys
 import tempfile
 import traceback
+import uuid
 
 SHIFT = 28800
 MAX_REVISION = (1 << 63) - 1
 MAX_TIME = (1 << 53) - 1
 MAX_COUNTER = 10 ** 9
 MAX_BOUND = (1 << 63) - 1
+
+# Binary synchronisation pack framing (see module docstring).
+PACK_MAGIC = b"SLPACK01"
+PACK_FORMAT = 1
+PACK_DIGEST_SIZE = hashlib.sha256().digest_size
+# Frames hold one JSON object; readings are bounded by the message
+# limits above, so a generous fixed cap suffices to reject corrupt
+# lengths without buffering unbounded data.
+PACK_MAX_FRAME = 1 << 20
 
 
 class BatchError(Exception):
@@ -168,6 +265,14 @@ class LedgerIOError(Exception):
 
 class AssignmentError(Exception):
     """The assignment JSONL given to `settle` is invalid."""
+
+
+class SyncError(Exception):
+    """A sync pack or a sync-state operation is invalid; nothing changed.
+
+    Like BatchError this means invalid input (exit status 2), not an
+    I/O failure.
+    """
 
 
 def _reject_constant(name):
@@ -260,6 +365,37 @@ CREATE TABLE IF NOT EXISTS uncertain_edge (
     seconds INTEGER NOT NULL,
     PRIMARY KEY (device, shift)
 );
+-- Centre role: one row once sync-init has run.  The identity is fixed
+-- for the life of the database; position is the committed version
+-- number of the current readings state.
+CREATE TABLE IF NOT EXISTS sync_center (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    identity TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+-- Replica role: one row once the first base-0 pack was received.  The
+-- source binding and position only move inside a receive transaction.
+CREATE TABLE IF NOT EXISTS sync_replica (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    source       TEXT NOT NULL,
+    position     INTEGER NOT NULL,
+    last_digest  TEXT NOT NULL
+);
+-- Centre-only durable log of every identity whose highest version has
+-- ever changed, with the position at which its latest change landed.
+-- One row per identity regardless of how many times it changed, so an
+-- incremental pack between two positions scans only changed
+-- identities — never the untouched history.
+CREATE TABLE IF NOT EXISTS sync_log (
+    device       TEXT NOT NULL,
+    reading_id   TEXT NOT NULL,
+    last_version INTEGER NOT NULL,
+    PRIMARY KEY (device, reading_id)
+) WITHOUT ROWID;
+-- Range access by version: an incremental pack looks up only the
+-- identities changed after its base, never walks the unchanged ones.
+CREATE INDEX IF NOT EXISTS sync_log_versions
+    ON sync_log (last_version);
 """
 
 
@@ -273,6 +409,24 @@ def connect(db_path):
     except sqlite3.Error as exc:
         raise LedgerIOError(f"cannot open ledger {db_path!r}: {exc}") from exc
     return conn
+
+
+# ---------------------------------------------------------------------------
+# Sync role helpers
+# ---------------------------------------------------------------------------
+
+def center_state(conn):
+    """Return (identity, position) of a centre database, else None."""
+    return conn.execute(
+        "SELECT identity, position FROM sync_center WHERE id = 1"
+    ).fetchone()
+
+
+def replica_state(conn):
+    """Return (source, position, last_digest) of a replica, else None."""
+    return conn.execute(
+        "SELECT source, position, last_digest FROM sync_replica WHERE id = 1"
+    ).fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -616,9 +770,29 @@ def apply_batch(db_path, input_path):
     conn = connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if replica_state(conn) is not None:
+            raise SyncError(
+                "this database is a sync replica: readings can only be "
+                "changed via sync-receive, not apply")
         received = load_batch(conn, input_path)
         applied = apply_winners(conn)
         check_time_conflicts(conn)
+        center = center_state(conn)
+        if center is not None and applied > 0:
+            # A position advance and the results of this apply commit
+            # together — same transaction, same visible version.  The
+            # log keeps one row per changed identity at the new
+            # position, no matter how often that identity changed.
+            new_position = center[1] + 1
+            conn.execute("UPDATE sync_center SET position = ? WHERE id = 1",
+                         (new_position,))
+            conn.executemany(
+                "INSERT INTO sync_log (device, reading_id, last_version) "
+                "VALUES (?, ?, ?) ON CONFLICT(device, reading_id) DO UPDATE "
+                "SET last_version = excluded.last_version",
+                conn.execute(
+                    "SELECT device, reading_id, ? FROM chosen",
+                    (new_position,)))
         conn.commit()
         return received, applied
     except BaseException:
@@ -1090,6 +1264,387 @@ def run_settle(db_path, devices, t_from, t_to, assign_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# Offline synchronisation: identity, packs, replicas
+# ---------------------------------------------------------------------------
+
+def sync_init(db_path):
+    """Enable the centre role on a database and fix its sync identity.
+
+    An already populated ledger snapshots every current highest version
+    (tombstones included) as position 1; an empty ledger starts at 0.
+    The identity, position and change log are written in one
+    transaction and can never be replaced afterwards.
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if replica_state(conn) is not None:
+            raise SyncError("this database is a sync replica and cannot "
+                            "be turned into a centre")
+        existing = center_state(conn)
+        if existing is not None:
+            raise SyncError(
+                f"sync is already enabled on this centre with identity "
+                f"{existing[0]!r}; the identity cannot be replaced")
+        identity = uuid.uuid4().hex
+        populated = conn.execute(
+            "SELECT 1 FROM readings LIMIT 1").fetchone() is not None
+        if populated:
+            position = 1
+            conn.execute(
+                "INSERT INTO sync_log (device, reading_id, last_version) "
+                "SELECT device, reading_id, 1 FROM readings")
+        else:
+            position = 0
+        conn.execute(
+            "INSERT INTO sync_center (id, identity, position) "
+            "VALUES (1, ?, ?)", (identity, position))
+        conn.commit()
+        return identity, position
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+class _DigestWriter:
+    """Binary file wrapper that hashes every byte written through it."""
+
+    def __init__(self, fh):
+        self.fh = fh
+        self.hash = hashlib.sha256()
+
+    def write(self, data):
+        self.fh.write(data)
+        self.hash.update(data)
+
+    def write_raw(self, data):
+        """Write without hashing (used for the trailing digest itself)."""
+        self.fh.write(data)
+
+
+def _pack_frame(writer, payload):
+    writer.write(len(payload).to_bytes(4, "little"))
+    writer.write(payload)
+
+
+def _pack_row_bytes(row):
+    device, reading_id, revision, op, epoch, time, counter = row
+    obj = {"device": device, "reading_id": reading_id,
+           "revision": revision, "op": op}
+    if op == "put":
+        obj.update(epoch=epoch, time=time, counter=counter)
+    return json.dumps(obj, ensure_ascii=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def build_pack(conn, base, output_path):
+    """Stream one increment pack onto one committed snapshot of `conn`.
+
+    Returns {"status": "no-update", ...} when base == the current
+    position (the output path is not touched), otherwise a "packed"
+    descriptor.  The caller owns the transaction; this function only
+    reads and must run inside an open snapshot.
+    """
+    center = center_state(conn)
+    if center is None:
+        if replica_state(conn) is not None:
+            raise SyncError("a sync replica cannot build centre packs")
+        raise SyncError("sync is not enabled on this database; run "
+                        "sync-init first")
+    identity, position = center
+    if not _is_int(base) or base < 0:
+        raise SyncError("base must be a non-negative integer")
+    if base > position:
+        raise SyncError(
+            f"base position {base} is beyond the current position "
+            f"{position}")
+    if base == position:
+        return {"status": "no-update", "source": identity,
+                "position": position}
+    end = position
+    if base == 0:
+        count_sql = "SELECT COUNT(*) FROM readings"
+        rows_sql = ("SELECT device, reading_id, revision, op, epoch, time, "
+                    "counter FROM readings ORDER BY device, reading_id")
+        params = ()
+    else:
+        # Only identities whose latest logged change is newer than the
+        # base participate; untouched history is never scanned.
+        count_sql = ("SELECT COUNT(*) FROM sync_log WHERE last_version > ?")
+        rows_sql = (
+            "SELECT r.device, r.reading_id, r.revision, r.op, r.epoch, "
+            "r.time, r.counter FROM sync_log AS s JOIN readings AS r "
+            "ON r.device = s.device AND r.reading_id = s.reading_id "
+            "WHERE s.last_version > ? ORDER BY r.device, r.reading_id")
+        params = (base,)
+    row_count = conn.execute(count_sql, params).fetchone()[0]
+    header = json.dumps(
+        {"format": PACK_FORMAT, "source": identity,
+         "base": base, "end": end},
+        ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+
+    def write_pack(fh):
+        """Write the whole pack to binary file object `fh`; return digest."""
+        writer = _DigestWriter(fh)
+        writer.write(PACK_MAGIC)
+        _pack_frame(writer, header)
+        cursor = conn.execute(rows_sql, params)
+        while True:
+            row = cursor.fetchone()
+            if row is None:
+                break
+            _pack_frame(writer, _pack_row_bytes(row))
+        writer.write((0).to_bytes(4, "little"))  # end-of-rows marker
+        fh.flush()
+        digest = writer.hash.digest()
+        writer.write_raw(digest)                 # not covered by itself
+        return digest
+
+    if output_path == "-":
+        digest = write_pack(sys.stdout.buffer)
+        sys.stdout.buffer.flush()
+    else:
+        directory = os.path.dirname(os.path.abspath(output_path))
+        base_name = os.path.basename(output_path)
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{base_name}.", suffix=".tmp", dir=directory)
+        except OSError as exc:
+            raise LedgerIOError(
+                f"cannot create temporary pack next to {output_path!r}: "
+                f"{exc.strerror or exc}") from exc
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                digest = write_pack(fh)
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, output_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    return {"status": "packed", "source": identity, "base": base,
+            "end": end, "rows": row_count, "digest": digest.hex(),
+            "path": output_path}
+
+
+def run_sync_pack(db_path, base, output_path):
+    conn = connect(db_path)
+    try:
+        # A deferred transaction on WAL pins the snapshot at the first
+        # read; a concurrent apply may commit afterwards and simply
+        # belongs to the next pack, while this pack's end and rows stay
+        # two views of the same committed version.
+        conn.execute("BEGIN")
+        conn.execute("SELECT 1 FROM readings LIMIT 1").fetchone()
+        result = build_pack(conn, base, output_path)
+        conn.commit()
+        return result
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+class _HashedReader:
+    """Binary reader that hashes every byte it consumes."""
+
+    def __init__(self, fh):
+        self.fh = fh
+        self.hash = hashlib.sha256()
+
+    def read(self, size):
+        data = self.fh.read(size)
+        self.hash.update(data)
+        return data
+
+    def read_raw(self, size):
+        """Read without hashing (used for the trailing digest itself)."""
+        return self.fh.read(size)
+
+    def read_exact(self, size, what):
+        data = self.read(size)
+        if len(data) != size:
+            raise SyncError(f"truncated pack while reading {what}")
+        return data
+
+
+def _validate_header(obj):
+    if not isinstance(obj, dict):
+        raise SyncError("pack header must be a JSON object")
+    if obj.get("format") != PACK_FORMAT:
+        raise SyncError(f"unsupported pack format {obj.get('format')!r}")
+    source = obj.get("source")
+    if not isinstance(source, str) or not source:
+        raise SyncError("pack header 'source' must be a non-empty string")
+    base = obj.get("base")
+    end = obj.get("end")
+    if not _is_int(base) or base < 0:
+        raise SyncError("pack header 'base' must be a non-negative integer")
+    if not _is_int(end) or end < base:
+        raise SyncError("pack header 'end' must be an integer >= base")
+    return {"format": PACK_FORMAT, "source": source, "base": base,
+            "end": end}
+
+
+def verify_pack(pack_path, sink=None):
+    """Fully verify a pack file, streaming each row to `sink`.
+
+    `sink` receives the tuple returned by validate_message.  Detects
+    truncation, altered content (digest mismatch) and extra trailing
+    bytes.  Returns (header, row_count, digest_hex).  Nothing in the
+    pack is trusted before the digest has checked out.
+    """
+    try:
+        fh = open(pack_path, "rb")
+    except OSError as exc:
+        raise SyncError(
+            f"cannot read pack {pack_path!r}: {exc.strerror or exc}") \
+            from exc
+    row_count = 0
+    with fh:
+        reader = _HashedReader(fh)
+        if reader.read_exact(len(PACK_MAGIC), "magic") != PACK_MAGIC:
+            raise SyncError("not a shift-ledger pack (bad magic)")
+        length = int.from_bytes(
+            reader.read_exact(4, "header length"), "little")
+        if not 0 < length <= PACK_MAX_FRAME:
+            raise SyncError(f"implausible header frame length {length}")
+        try:
+            header = _validate_header(json.loads(
+                reader.read_exact(length, "header").decode("utf-8")))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise SyncError(f"invalid pack header: {exc}") from exc
+        while True:
+            length = int.from_bytes(
+                reader.read_exact(4, "frame length"), "little")
+            if length == 0:
+                break
+            if length > PACK_MAX_FRAME:
+                raise SyncError(f"implausible frame length {length}")
+            raw = reader.read_exact(length, "row frame")
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise SyncError(f"invalid row frame: {exc}") from exc
+            try:
+                message = validate_message(obj, f"pack row {row_count + 1}")
+            except BatchError as exc:
+                raise SyncError(str(exc)) from exc
+            if sink is not None:
+                sink(message)
+            row_count += 1
+        # The digest covers everything before it; read it without
+        # feeding it back into the hash.
+        digest = reader.read_raw(PACK_DIGEST_SIZE)
+        if len(digest) != PACK_DIGEST_SIZE:
+            raise SyncError("truncated pack while reading digest")
+        if reader.fh.read(1):
+            raise SyncError("pack has extra trailing bytes after the "
+                            "digest")
+    if not hmac.compare_digest(digest, reader.hash.digest()):
+        raise SyncError("pack digest mismatch: content altered or corrupt")
+    if header["end"] == header["base"] and row_count:
+        raise SyncError("pack ending at its base position must carry no "
+                        "rows")
+    return header, row_count, reader.hash.hexdigest()
+
+
+def receive_pack(db_path, pack_path):
+    """Apply a verified pack to a replica database in one transaction."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if center_state(conn) is not None:
+            raise SyncError("a centre database cannot receive replica "
+                            "packs")
+        conn.execute("DROP TABLE IF EXISTS temp.batch")
+        conn.execute(
+            "CREATE TEMP TABLE batch ("
+            "device TEXT NOT NULL, reading_id TEXT NOT NULL, "
+            "revision INTEGER NOT NULL, op TEXT NOT NULL, "
+            "epoch TEXT, time INTEGER, counter INTEGER, "
+            "content TEXT NOT NULL)")
+        insert = ("INSERT INTO batch (device, reading_id, revision, op, "
+                  "epoch, time, counter, content) "
+                  "VALUES (?,?,?,?,?,?,?,?)")
+        # The whole file — digest included — is verified before any
+        # persistent table is touched; rows only land in a temp table.
+        header, row_count, digest_hex = verify_pack(
+            pack_path, sink=lambda msg: conn.execute(insert, msg))
+        try:
+            duplicate = conn.execute(
+                "SELECT device, reading_id FROM temp.batch "
+                "GROUP BY device, reading_id HAVING COUNT(*) > 1 "
+                "LIMIT 1").fetchone()
+        except sqlite3.Error as exc:
+            raise SyncError(f"invalid pack contents: {exc}") from exc
+        if duplicate is not None:
+            raise SyncError(
+                f"pack carries more than one row for reading "
+                f"{duplicate[1]!r} of device {duplicate[0]!r}; a pack "
+                f"holds one end-state row per identity")
+        replica = replica_state(conn)
+        if replica is None:
+            if header["base"] != 0:
+                raise SyncError(
+                    f"the first pack must have base 0 for an empty "
+                    f"unbound database; got base {header['base']}")
+            for table in ("readings", "confirmed", "uncertain_edge"):
+                if conn.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0]:
+                    raise SyncError(
+                        "the first pack can only enter an empty database")
+        else:
+            source, position, last_digest = replica
+            if header["source"] != source:
+                raise SyncError(
+                    f"pack source {header['source']!r} does not match the "
+                    f"bound source {source!r}")
+            if digest_hex == last_digest:
+                # Byte-identical re-delivery of the last accepted file:
+                # a successful no-op.  Its base is the old position by
+                # definition, so recognise it before the base check.
+                # A different file with the same end position has a
+                # different digest and is refused below.
+                conn.rollback()
+                return {"status": "replay", "source": source,
+                        "position": position, "rows": 0}
+            if header["base"] != position:
+                raise SyncError(
+                    f"pack base {header['base']} does not equal the "
+                    f"replica position {position}: missing, reordered or "
+                    f"foreign packs are not merged")
+            if header["end"] < position:
+                raise SyncError(
+                    f"pack end {header['end']} is behind the replica "
+                    f"position {position}")
+        try:
+            applied = apply_winners(conn)
+            check_time_conflicts(conn)
+        except (BatchError, sqlite3.Error) as exc:
+            raise SyncError(f"pack cannot be applied: {exc}") from exc
+        conn.execute(
+            "INSERT INTO sync_replica (id, source, position, last_digest) "
+            "VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "source = excluded.source, position = excluded.position, "
+            "last_digest = excluded.last_digest",
+            (header["source"], header["end"], digest_hex))
+        conn.commit()
+        return {"status": "received", "source": header["source"],
+                "position": header["end"], "rows": applied}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
 
@@ -1140,6 +1695,27 @@ def build_parser():
     p_settle.add_argument("devices", nargs="+", metavar="DEVICE",
                           help="device(s) to settle; duplicates are "
                                "settled once")
+
+    p_init = sub.add_parser(
+        "sync-init", help="enable the centre role on a database and "
+                          "persist its fixed sync identity")
+    p_init.add_argument("db", help="SQLite ledger path")
+
+    p_pack = sub.add_parser(
+        "sync-pack", help="publish an increment pack from a centre "
+                          "database for one base position")
+    p_pack.add_argument("db", help="centre SQLite ledger path")
+    p_pack.add_argument("--base", type=int, required=True, metavar="N",
+                        help="base position (non-negative); 0 means a "
+                             "full pack from blank")
+    p_pack.add_argument("-o", "--output", default="-",
+                        help="pack destination; '-' means stdout "
+                             "(default)")
+
+    p_recv = sub.add_parser(
+        "sync-receive", help="apply a verified pack to a branch replica")
+    p_recv.add_argument("db", help="replica SQLite ledger path")
+    p_recv.add_argument("pack", help="pack file received from the centre")
     return parser
 
 
@@ -1153,13 +1729,38 @@ def main(argv=None):
         elif args.command == "query":
             run_query(args.db, args.device, args.start, args.end,
                       args.output)
+        elif args.command == "sync-init":
+            identity, position = sync_init(args.db)
+            print(f"shift_ledger: sync enabled; identity={identity} "
+                  f"position={position}", file=sys.stderr)
+        elif args.command == "sync-pack":
+            result = run_sync_pack(args.db, args.base, args.output)
+            if result["status"] == "no-update":
+                print(f"shift_ledger: no update: base {args.base} is the "
+                      f"current position of source {result['source']}; "
+                      f"target file not touched", file=sys.stderr)
+            else:
+                print(f"shift_ledger: pack {result['base']} -> "
+                      f"{result['end']} ({result['rows']} identity "
+                      f"row(s), source {result['source']})", file=sys.stderr)
+        elif args.command == "sync-receive":
+            result = receive_pack(args.db, args.pack)
+            if result["status"] == "replay":
+                print(f"shift_ledger: identical pack replayed; replica "
+                      f"still at position {result['position']} "
+                      f"(source {result['source']})", file=sys.stderr)
+            else:
+                print(f"shift_ledger: received {result['rows']} "
+                      f"identity row(s); replica now at position "
+                      f"{result['position']} (source "
+                      f"{result['source']})", file=sys.stderr)
         else:
             received, kept, emitted = run_settle(
                 args.db, args.devices, args.from_, args.to_,
                 args.assign, args.output)
             print(f"shift_ledger: exported {emitted} row(s) from {kept} "
                   f"of {received} assignment(s)", file=sys.stderr)
-    except (BatchError, QueryError, AssignmentError) as exc:
+    except (BatchError, QueryError, AssignmentError, SyncError) as exc:
         print(f"shift_ledger: invalid input: {exc}", file=sys.stderr)
         return 2
     except LedgerIOError as exc:
